@@ -8,6 +8,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
 
 // класс пула потоков для управления потоками
 class ThreadPool {
@@ -51,16 +52,24 @@ public:
         }
     }
 
+    // объявляем шаблонную функцию enqueue - это std::future который представляет будущий результат выполнения функции func.
     template <typename Func>
-    void enqueue(Func&& func) {
+    // функция позволяет добавлять задачи в очередь пула потоков для их асинхронного выполнения
+    auto enqueue(Func&& func) -> std::future<decltype(func())> {
+        // делаем обертку над функцией func что-бы его асинхронно выполнить и получить результат
+        // общий указатель: std::make_shared<std::packaged_task позволит передать
+        // обертку(func) в другой поток и сохранить ее(func) в памяти до завершения выполнения задачи
+        auto task = std::make_shared<std::packaged_task<decltype(func())()>>(std::forward<Func>(func));
+        std::future<decltype(func())> result = task->get_future(); // создаем будущий результат выполнения func
         {
-            std::unique_lock<std::mutex> lock(queueMutex);
-            if (stop) {
+            std::unique_lock<std::mutex> lock(queueMutex); // захват мьютекса
+            if (stop) { // если пул потоков остановлен
                 throw std::runtime_error("поставить в очередь остановленный ThreadPool");
             }
-            tasks.emplace(std::forward<Func>(func)); // добавляем задачу в очередь
+            tasks.emplace([task]() { (*task)(); }); // добавляем функцию(задачу) в очередь
         }
-        condition.notify_one(); // сигнал для одного из потоков о наличии новой задачи
+        condition.notify_one(); // сигнал для одного из потоков о наличии новой задачи в очереди
+        return result; // возвращаем объект std::future как будущий результат выполнения
     }
 
 private:
@@ -93,30 +102,44 @@ int partition(std::vector<T>& array, int left, int right) {
 
 // функция быстрой сортировки
 template <typename T>
-void quicksort(std::vector<T>& array, int left, int right, ThreadPool& pool) {
+std::future<void> quicksort(std::vector<T>& array, int left, int right, ThreadPool& pool) {
     if (left < right) {
         int pivot = partition(array, left, right); // находим опорный элемент
         if (right - left > 10000) { // если размер левой части массива больше порогового значения, то...
-            // запускаем правую часть сортировки асинхронно
-            pool.enqueue([&array, left, right, &pool]() {
+            // асинхронно вызываем рекурсию для правой части сортировки
+            auto right_future = pool.enqueue([&array, left, right, &pool]() {
                 quicksort(array, left, right, pool);
             });
 
-            // cортируем левую часть синхронно
-            quicksort(array, pivot + 1, right, pool);
+            quicksort(array, pivot + 1, right, pool); // сортируем левую часть синхронно
+            right_future.wait(); // // ожидаем завершения сортировки правой части
+            return right_future; // возвращаем фьючерс как сигнал о завершении сортировки правой части
         } else { // иначе, если размер левой части массива меньше порогового значения, то...
             // сортируем обе части синхронно
             quicksort(array, left, pivot, pool);
             quicksort(array, pivot + 1, right, pool);
+
+            // возвращаем завершенный фьючерс так как правая часть сортируется синхронно
+            return std::async(std::launch::deferred, [] {});
         }
     }
+    return std::async(std::launch::deferred, [] {}); // возвращаем завершенный фьючерс
 }
 
 int main() {
-    std::vector<int> array = {3, 6, 1, 8, 2, 7, 4, 5};
+    std::vector<int> array = {3, 6, 1, 8, 2, 7, 4, 5, 1, 8, 6, 3, 4};
     ThreadPool pool(std::thread::hardware_concurrency()); // hardware_concurrency() для того что-бы использовать ядра процессора
+
     try {
-        quicksort(array, 0, array.size() - 1, pool); // запуск сортировки
+        auto start_time = std::chrono::high_resolution_clock::now(); // начальное время
+
+        auto result_future = quicksort(array, 0, array.size() - 1, pool); // запуск сортировки
+        result_future.wait(); // ждем завершения всей сортировки
+
+        auto end_time = std::chrono::high_resolution_clock::now(); // конечное время
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+
+        std::cout << "Время выполнения сортировки: " << duration.count() << " миллисекунд" << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "Исключение в main: " << e.what() << std::endl;
     }
